@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+
+# Local Codex state and exported conversation data
+.codex/
+.agents/
+backups/
+codex-session-backups*/
+rollouts/
+_unassigned/
+*.jsonl
+*.sqlite
+*.sqlite-*
+
+# Local credentials
+.env
+.env.*
+!.env.example
+auth.json
