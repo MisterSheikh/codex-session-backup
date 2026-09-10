@@ -1,6 +1,10 @@
 # Codex project session backups
 
+An independent community tool, not affiliated with or endorsed by OpenAI.
+
 A small Python 3.10+ CLI with no dependencies. Inspected and integration-tested against **codex-cli 0.154.0** and its installed app-server protocol on September 10, 2026.
+
+Licensed under the [MIT License](LICENSE).
 
 ```bash
 ./codex_sessions.py export /path/to/project /path/to/new-backup
