@@ -1,11 +1,12 @@
 """Opt-in: python3 tests/integration_codex.py [source-codex-home]. Copies one session; never resumes the original."""
-import sys,os,json,sqlite3,pathlib,tempfile,subprocess,select,shutil,base64
+import sys,os,json,sqlite3,pathlib,tempfile,subprocess,select,shutil,base64,argparse
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]))
 import codex_sessions as cs
 temporary=tempfile.TemporaryDirectory(prefix='backup-integration-');root=pathlib.Path(temporary.name);source=root/'source';target=root/'target';source.mkdir();target.mkdir()
-live=pathlib.Path(sys.argv[1]).expanduser().resolve() if len(sys.argv)>1 else pathlib.Path.home()/'.codex'
+parser=argparse.ArgumentParser();parser.add_argument('home',nargs='?',default=str(pathlib.Path.home()/'.codex'));parser.add_argument('session_id',nargs='?');parser.add_argument('--compact',action='store_true');args=parser.parse_args()
+live=pathlib.Path(args.home).expanduser().resolve()
 c=cs.connect(live/'state_5.sqlite')
-r=dict(c.execute('SELECT * FROM threads WHERE id=?',(sys.argv[2],)).fetchone()) if len(sys.argv)>2 else dict(c.execute("select * from threads where source='cli' and archived=0 order by created_at desc limit 1").fetchone())
+r=dict(c.execute('SELECT * FROM threads WHERE id=?',(args.session_id,)).fetchone()) if args.session_id else dict(c.execute("select * from threads where source='cli' and archived=0 order by created_at desc limit 1").fetchone())
 sid=r['id']
 chain_paths=cs.chains.resolve(pathlib.Path(r['rollout_path']),cs.chains.catalog(list(cs.rollout_files(live))))
 physical_ids=[cs.chains.thread_id(p,cs.file_meta(p)) for p in chain_paths]
@@ -34,7 +35,7 @@ with sqlite3.connect(source/'thread_history_1.sqlite') as hd:
  body=json.loads(item[1]);body['content'].append({'type':'localImage','path':str(fixture_asset)})
  hd.execute('UPDATE thread_items SET item_json=? WHERE thread_id=? AND item_id=?',(json.dumps(body),physical_ids[0],item[0]))
 print('Testing one copied CLI session and a synthetic attachment in disposable state')
-print(cs.export(source,r['cwd'],root/'backup',include_attachments=True,selected_paths=[source/'sessions'/pathlib.Path(r['rollout_path']).name]))
+print(cs.export(source,r['cwd'],root/'backup',include_attachments=True,compact=args.compact,selected_paths=[source/'sessions'/pathlib.Path(r['rollout_path']).name]))
 assert cs.verify(root/'backup')['valid']
 fixture_asset.unlink()
 print(cs.restore(target,root/'backup',str(root/'moved')))

@@ -21,8 +21,10 @@ Keep the repository's Python files together. The default session location is `~/
 ## Back up one project
 
 ```bash
-python3 codex_sessions.py export ~/my-project ~/my-project-backup --include-attachments
+python3 codex_sessions.py export ~/my-project ~/my-project-backup --include-attachments --compact
 ```
+
+`--compact` reduces storage losslessly by deduplicating embedded images and compressing the backup. Omit it to keep ordinary, directly inspectable JSON files.
 
 This includes sessions started in the project and its subdirectories, including archived sessions. Omit `--include-attachments` if you only want conversation data; external attachment references will still be reported.
 
@@ -37,12 +39,22 @@ python3 codex_sessions.py export-all ~/codex-session-backups --dry-run
 Create the backups:
 
 ```bash
-python3 codex_sessions.py export-all ~/codex-session-backups --include-attachments
+python3 codex_sessions.py export-all ~/codex-session-backups --include-attachments --compact
 ```
 
 Each project gets an individually restorable subdirectory. Linked conversation segments are included automatically; keep the entire folder together. `index.json` lists the projects and any problems. Sessions with unclear project ownership, and extra versions of duplicate sessions, are preserved under `_unassigned` for manual review; that folder is not a normal restorable project backup.
 
 For later snapshots, choose a new destination such as `~/codex-session-backups-next`.
+
+## Compact backups
+
+With `--compact`, each project folder contains `compact.json` and `payload.tar.gz`. Keep both files together. Each project remains independent and can be restored selectively.
+
+Use the same `verify` and `restore` commands for compact and ordinary backups—no manual extraction is needed. The tool reconstructs the original files exactly and checks their hashes before verifying or restoring them. Images are retained; compression is not image deletion or quality reduction.
+
+Compact verification and restoration need temporary disk space for the expanded backup **plus** intermediate image/data files. Export also stages an ordinary backup before packing it. For a large backup, allow several times its compact size as working space. Temporary files are cleaned up after success or an ordinary failure. `TMPDIR` can select a larger temporary filesystem for verification/restoration.
+
+In measurements on one 6.09 GB collection, per-project deduplication plus gzip reduced storage to about 1.59 GB. Savings vary with the content.
 
 ## Verify a backup
 
@@ -68,7 +80,7 @@ Exit codes: **0** = checks passed without warnings; **1** = error or invalid bac
 
 ## Restore one project
 
-On the destination machine, install and launch Codex once, then close it. Copy the **entire project backup folder**, including any `assets` directory, and run:
+On the destination machine, install and launch Codex once, then close it. Copy the **entire project backup folder** (both compact files, or the complete ordinary directory), and run:
 
 ```bash
 python3 codex_sessions.py restore ~/my-project-backup ~/projects/my-project
@@ -92,8 +104,10 @@ It does **not** download remote URLs, copy arbitrary files from your project or 
 
 ## Compatibility and privacy
 
-Tested with **Codex CLI 0.154.0**. Codex's internal storage can change; prefer matching versions for migration. Backups from the original version-1 format remain supported, but verification reports their unknown attachment completeness. New exports use format version 3, which also preserves linked history segments. Ordinary version-1 and version-2 backups remain supported; older backups missing linked segments must be re-exported from the original installation.
+Tested with **Codex CLI 0.154.0**. Codex's internal storage can change; prefer matching versions for migration. Backups from the original version-1 format remain supported, but verification reports their unknown attachment completeness. The underlying session format is version 3, which also preserves linked history segments. Ordinary version-1 and version-2 backups remain supported; older backups missing linked segments must be re-exported from the original installation.
 
 Credentials, global configuration, and caches are excluded. **Conversations and attachments can themselves contain secrets or personal information. Keep your backups private.** Checksums detect corruption; they do not establish who created or modified a backup.
 
 For storage details, failure behavior, and testing instructions, see [implementation notes](docs/implementation.md).
+
+Compact containers use their own version-1 format; older versions of this tool cannot read them. Keep this tool with your archives. Technical details are in [the compact format notes](docs/compact-format.md).

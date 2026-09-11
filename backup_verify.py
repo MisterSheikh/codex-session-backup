@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path, PureWindowsPath
 import uuid
+import compact_backup
 import session_chains as chains
 from session_assets import asset_references
 
@@ -46,6 +47,11 @@ def verify(backup, _visited=None):
         visited.add(backup)
         if (backup/'manifest.json').exists() and (backup/'index.json').exists():
             raise ValueError('Ambiguous backup: both manifest.json and index.json exist')
+        if (backup/'compact.json').exists():
+            with compact_backup.opened(backup) as expanded:
+                inner=verify(expanded)
+                inner['backup']=str(backup);inner['storage']='compact'
+                return inner
         collection = (backup/'index.json').exists()
         doc = json.loads((backup/('index.json' if collection else 'manifest.json')).read_text())
         if not isinstance(doc,dict):
@@ -60,12 +66,14 @@ def verify(backup, _visited=None):
                     continue
                 try:
                     child = contained(backup,project['directory'])
-                    report = verify(child,visited)
+                    with compact_backup.opened(child) as expanded:
+                        report = verify(expanded,visited)
+                        manifest = json.loads((expanded/'manifest.json').read_text())
+                    report['backup']=str(child)
                     children.append(report)
                     errors.extend(f'{project["directory"]}: {e}' for e in report['errors'])
                     warnings.extend(f'{project["directory"]}: {w}' for w in report['warnings'])
                     result['sessions'] += report['sessions']; result['assets'] += report['assets']
-                    manifest = json.loads((child/'manifest.json').read_text())
                     actual = [s['id'] for s in manifest['sessions']]
                     expected = [s['id'] for s in project['sessions']]
                     if sorted(actual) != sorted(expected) or len(actual) != project['exported'] or manifest['project_path'] != project['project_path']:

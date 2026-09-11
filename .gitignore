@@ -18,3 +18,7 @@ _unassigned/
 .env.*
 !.env.example
 auth.json
+
+# Compact conversation backups
+compact.json
+payload.tar.gz

@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from session_assets import inventory, collect, replace_references
 from backup_verify import verify, checked_file
 
+import compact_backup
 import session_chains as chains
 
 FORMAT = 3
@@ -76,7 +77,15 @@ def rollout_files(home):
         yield from (home / folder).rglob('*.jsonl')
 
 
-def export(home, project, destination, *, selected_paths=None, include_attachments=False):
+def export(home, project, destination, *, selected_paths=None, include_attachments=False, compact=False):
+    if compact:
+        if destination.exists():raise ValueError(f'Destination already exists: {destination}')
+        destination.parent.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=destination.parent) as tmp:
+            raw=Path(tmp)/'project'
+            result=export(home,project,raw,selected_paths=selected_paths,include_attachments=include_attachments)
+            result.update(compact_backup.pack(raw,destination));result['backup']=str(destination)
+            return result
     project = str(Path(project).expanduser().resolve()) if selected_paths is None else project
     if destination.exists():
         raise ValueError(f'Destination already exists: {destination}')
@@ -191,7 +200,7 @@ def project_root(cwd, registered=()):
     return cwd, 'recorded-cwd'
 
 
-def export_all(home, destination, dry_run=False, include_attachments=False):
+def export_all(home, destination, dry_run=False, include_attachments=False, compact=False):
     if destination.exists():
         raise ValueError(f'Destination already exists: {destination}')
     state = database(home, 'state_*.sqlite', 'threads')
@@ -250,7 +259,8 @@ def export_all(home, destination, dry_run=False, include_attachments=False):
         for project in report['projects']:
             try:
                 result = export(home, project['project_path'], stage/project['directory'],
-                                selected_paths=groups[project['project_path']]['paths'],include_attachments=include_attachments)
+                                selected_paths=groups[project['project_path']]['paths'],include_attachments=include_attachments,compact=compact)
+                project['storage']=result.get('storage','directory')
                 project['unresolved_assets'] = result['unresolved_assets']
                 project['exported'] = result['exported']
                 project['status'] = 'exported'
@@ -320,6 +330,9 @@ def insert(db, schema, table, row):
 
 
 def restore(home, backup, new_project=None):
+    if (backup/'compact.json').exists():
+        with compact_backup.opened(backup) as expanded:
+            return restore(home,expanded,new_project)
     manifest = json.loads((backup/'manifest.json').read_text())
     if manifest.get('format') != 'codex-project-sessions' or manifest.get('version') not in (1,2,FORMAT):
         raise ValueError('Unsupported backup format/version')
@@ -438,10 +451,12 @@ def main():
     sub=parser.add_subparsers(dest='command',required=True)
     exp=sub.add_parser('export');exp.add_argument('project_path');exp.add_argument('destination',type=Path)
     exp.add_argument('--include-attachments',action='store_true')
+    exp.add_argument('--compact',action='store_true',help='Deduplicate embedded images and gzip each project backup')
     check=sub.add_parser('verify',help='Check a backup offline without restoring it');check.add_argument('backup',type=Path)
     bulk=sub.add_parser('export-all', help='Export all sessions grouped into separate project backups')
     bulk.add_argument('destination',type=Path);bulk.add_argument('--dry-run',action='store_true')
     bulk.add_argument('--include-attachments',action='store_true')
+    bulk.add_argument('--compact',action='store_true',help='Create independently restorable compact project backups')
     res=sub.add_parser('restore');res.add_argument('backup',type=Path);res.add_argument('new_project_path',nargs='?')
     args=parser.parse_args()
     try:
@@ -449,9 +464,9 @@ def main():
         if args.command == 'verify':
             result=verify(args.backup.expanduser().resolve())
         elif args.command == 'export-all':
-            result=export_all(home,args.destination.expanduser().resolve(),args.dry_run,args.include_attachments)
+            result=export_all(home,args.destination.expanduser().resolve(),args.dry_run,args.include_attachments,args.compact)
         elif args.command == 'export':
-            result=export(home,args.project_path,args.destination.expanduser().resolve(),include_attachments=args.include_attachments)
+            result=export(home,args.project_path,args.destination.expanduser().resolve(),include_attachments=args.include_attachments,compact=args.compact)
         else:
             result=restore(home,args.backup.expanduser().resolve(),args.new_project_path)
         print(dumps(result),end='')
