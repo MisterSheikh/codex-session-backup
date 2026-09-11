@@ -14,7 +14,12 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 
-FORMAT = 1
+from session_assets import inventory, collect, replace_references
+from backup_verify import verify, checked_file
+
+import session_chains as chains
+
+FORMAT = 3
 HISTORY = ('thread_turns', 'thread_items', 'thread_history_projection_state', 'thread_realtime_items')
 RELATED = ('thread_dynamic_tools',)
 # Only session metadata, never installation/project/account records.
@@ -58,8 +63,7 @@ def rows(db, table, sid, key='thread_id'):
 
 
 def meta(data):
-    first = json.loads(data.splitlines()[0])
-    return first['payload'] if first.get('type') == 'session_meta' else first
+    return chains.metadata(data)
 
 
 def file_meta(path):
@@ -72,7 +76,7 @@ def rollout_files(home):
         yield from (home / folder).rglob('*.jsonl')
 
 
-def export(home, project, destination, *, selected_paths=None):
+def export(home, project, destination, *, selected_paths=None, include_attachments=False):
     project = str(Path(project).expanduser().resolve()) if selected_paths is None else project
     if destination.exists():
         raise ValueError(f'Destination already exists: {destination}')
@@ -82,6 +86,7 @@ def export(home, project, destination, *, selected_paths=None):
     with connect(state) as db, connect(history) as hd:
         db.execute('BEGIN'); hd.execute('BEGIN')
         indexed = {r['id']: dict(r) for r in db.execute('SELECT * FROM threads')}
+        candidates = chains.catalog(list(rollout_files(home)))
         paths = set(selected_paths) if selected_paths is not None else set(rollout_files(home))
         if selected_paths is None:
             paths.update(Path(r['rollout_path']) for r in indexed.values() if relative(r['cwd'], project) is not None)
@@ -99,6 +104,10 @@ def export(home, project, destination, *, selected_paths=None):
                 continue
             if relative(cwd, project) is None:
                 continue
+            canonical = Path(row['rollout_path']) if row else p
+            if canonical != p and canonical.exists() and file_meta(canonical).get('id') == sid:
+                if p in chains.resolve(canonical,candidates): continue
+                raise ValueError(f'Additional unlinked rollout for session {sid}; use export-all to preserve it separately')
             if str(uuid.UUID(sid)) != sid or sid in seen:
                 raise ValueError(f'Invalid or duplicate session ID: {sid}')
             seen.add(sid)
@@ -123,17 +132,48 @@ def export(home, project, destination, *, selected_paths=None):
                     approval_mode='on-request', archived=int(item['archived']), history_mode=m.get('history_mode','legacy'))
                 if item['thread']['history_mode'] != 'legacy':
                     raise ValueError(f'Paginated session {sid} lacks an index; repair it with Codex before export.')
+            chain_paths = chains.resolve(p,candidates)
+            if len(chain_paths)>1:
+                segments=[]
+                for source in chain_paths:
+                    if source.suffix!='.jsonl' or not any(source.resolve().is_relative_to((home/f).resolve()) for f in ('sessions','archived_sessions')):
+                        raise ValueError('History dependency outside supported rollout storage')
+                    before_segment=source.stat(); segment_data=source.read_bytes();after_segment=source.stat()
+                    if (before_segment.st_size,before_segment.st_mtime_ns)!=(after_segment.st_size,after_segment.st_mtime_ns):raise ValueError('History segment changed during export')
+                    if source==p and segment_data!=data:raise ValueError('Active segment changed during export')
+                    sm=meta(segment_data);key=chains.thread_id(source,sm)
+                    if relative(sm.get('cwd',cwd),project) is None:raise ValueError('Cross-project history dependency requires a separate explicit export strategy')
+                    name=item['file'] if source==p else f'segments/{sid}/{key}.jsonl'
+                    payloads[name]=segment_data
+                    segment={'thread_id':key,'session_id':sm['id'],'file':name,'sha256':hashlib.sha256(segment_data).hexdigest(),
+                        'original_rollout_path':str(source),'archived':('archived_sessions' in source.parts),'history':{t:rows(hd,t,key) for t in HISTORY},'related':{t:rows(db,t,key) for t in RELATED}}
+                    segments.append(segment)
+                chains.validate([(sg,payloads[sg['file']]) for sg in segments],segments[-1]['thread_id'])
+                item['segments']=segments;item['active_thread_id']=segments[-1]['thread_id']
+                item['history']={t:[] for t in HISTORY};item['related']={t:[] for t in RELATED}
             sessions.append(item); payloads[item['file']] = data
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=destination.parent) as staging:
         stage = Path(staging)/'backup'; (stage/'rollouts').mkdir(parents=True, mode=0o700)
         for name,data in payloads.items():
+            (stage/name).parent.mkdir(parents=True,exist_ok=True,mode=0o700)
             (stage/name).write_bytes(data); (stage/name).chmod(0o600)
+        unresolved = 0
+        for session in sessions:
+            records = (json.loads(line) for line in payloads[session['file']].splitlines())
+            refs, embedded = inventory(records,session['history'],home)
+            for segment in session.get('segments',[]):
+                segment_refs, count = inventory((json.loads(line) for line in payloads[segment['file']].splitlines()),segment['history'],home)
+                refs.update(segment_refs)
+                if segment['file']!=session['file']:embedded+=count
+            session['assets'] = collect(refs,home,stage,session['id'],include_attachments)
+            session['embedded_media_records'] = embedded
+            unresolved += sum(a['status']=='unresolved' for a in session['assets'])
         manifest = {'format':'codex-project-sessions','version':FORMAT,'exported_at':datetime.now(timezone.utc).isoformat(),
-                    'project_path':project,'source_databases':[state.name,history.name], 'sessions':sessions}
+                    'project_path':project,'source_codex_home':str(home),'skipped_without_cwd':skipped,'source_databases':[state.name,history.name], 'sessions':sessions}
         (stage/'manifest.json').write_text(dumps(manifest)); (stage/'manifest.json').chmod(0o600)
         stage.rename(destination)
-    return {'exported':len(sessions),'backup':str(destination),'skipped_without_cwd':skipped}
+    return {'exported':len(sessions),'backup':str(destination),'skipped_without_cwd':skipped,'unresolved_assets':unresolved,'complete':not unresolved and not skipped}
 
 
 def project_root(cwd, registered=()):
@@ -151,7 +191,7 @@ def project_root(cwd, registered=()):
     return cwd, 'recorded-cwd'
 
 
-def export_all(home, destination, dry_run=False):
+def export_all(home, destination, dry_run=False, include_attachments=False):
     if destination.exists():
         raise ValueError(f'Destination already exists: {destination}')
     state = database(home, 'state_*.sqlite', 'threads')
@@ -162,6 +202,11 @@ def export_all(home, destination, dry_run=False):
             registered = [r[0] for r in db.execute('SELECT path FROM project_roots')]
     paths = set(rollout_files(home))
     paths.update(Path(r['rollout_path']) for r in indexed.values())
+    candidates=chains.catalog([p for p in paths if p.is_file()])
+    dependencies=set()
+    for row in indexed.values():
+        try: dependencies.update(chains.resolve(Path(row['rollout_path']),candidates)[:-1])
+        except (OSError,ValueError,KeyError): pass  # The owning project reports the failure during export.
     groups, unassigned = {}, []
     for path in sorted(paths):
         try:
@@ -170,6 +215,7 @@ def export_all(home, destination, dry_run=False):
             cwd = m.get('cwd') or indexed.get(sid, {}).get('cwd')
             canonical = Path(indexed[sid]['rollout_path']) if sid in indexed else None
             if canonical and canonical.resolve() != path.resolve() and canonical.is_file() and file_meta(canonical).get('id') == sid:
+                if path in dependencies: continue
                 unassigned.append({'rollout_path': str(path), 'id': sid, 'cwd': cwd,
                     'error': 'Additional rollout for the same ID; the indexed rollout is exported in its project backup',
                     'indexed_rollout_path': str(canonical)})
@@ -204,7 +250,8 @@ def export_all(home, destination, dry_run=False):
         for project in report['projects']:
             try:
                 result = export(home, project['project_path'], stage/project['directory'],
-                                selected_paths=groups[project['project_path']]['paths'])
+                                selected_paths=groups[project['project_path']]['paths'],include_attachments=include_attachments)
+                project['unresolved_assets'] = result['unresolved_assets']
                 project['exported'] = result['exported']
                 project['status'] = 'exported'
                 report['exported'] += result['exported']
@@ -229,7 +276,7 @@ def export_all(home, destination, dry_run=False):
                 report['preserved_unassigned'] += 1
             except (OSError,ValueError) as e:
                 entry['copy_error'] = str(e)
-        report['complete'] = not unassigned and all(p['status']=='exported' for p in report['projects'])
+        report['complete'] = not unassigned and all(p['status']=='exported' and not p.get('unresolved_assets') for p in report['projects'])
         (stage/'index.json').write_text(dumps(report)); (stage/'index.json').chmod(0o600)
         stage.rename(destination)
     return report
@@ -250,13 +297,14 @@ def remap(value, old, new):
     return value
 
 
-def rewrite(data, old, new):
+def rewrite(data, old, new, assets=None):
     result, offsets, before, after = [], {}, 0, 0
     for line in data.splitlines(keepends=True):
         offsets[before] = after
         record = json.loads(line)
-        if record.get('type') in ('session_meta','turn_context','world_state') or (record.get('type') == 'event_msg' and record.get('payload',{}).get('type') == 'thread_settings_applied'):
+        if new and (record.get('type') in ('session_meta','turn_context','world_state') or (record.get('type') == 'event_msg' and record.get('payload',{}).get('type') == 'thread_settings_applied')):
             record = remap(record,old,new)
+        if assets: record = replace_references(record,assets)
         changed = (json.dumps(record,ensure_ascii=False,separators=(',',':'))+'\n').encode()
         result.append(changed); before += len(line); after += len(changed)
     offsets[before] = after
@@ -273,13 +321,18 @@ def insert(db, schema, table, row):
 
 def restore(home, backup, new_project=None):
     manifest = json.loads((backup/'manifest.json').read_text())
-    if manifest.get('format') != 'codex-project-sessions' or manifest.get('version') != FORMAT:
+    if manifest.get('format') != 'codex-project-sessions' or manifest.get('version') not in (1,2,FORMAT):
         raise ValueError('Unsupported backup format/version')
+    if manifest['version'] >= 2:
+        report = verify(backup)
+        if not report['valid']: raise ValueError('; '.join(report['errors']))
+    if any(s.get('segments') for s in manifest['sessions']):
+        return chains.restore_native(home,backup,manifest,new_project)
     old = manifest['project_path']
     new = str(Path(new_project).expanduser().resolve()) if new_project else None
     state = database(home,'state_*.sqlite','threads')
     history = database(home,'thread_history_*.sqlite','thread_turns')
-    prepared, ids = [], set()
+    prepared, ids, asset_files, asset_mappings = [], set(), {}, {}
     for s in manifest['sessions']:
         sid = s['id']
         if str(uuid.UUID(sid)) != sid or sid in ids:
@@ -291,13 +344,28 @@ def restore(home, backup, new_project=None):
         data = p.read_bytes()
         if hashlib.sha256(data).hexdigest() != s['sha256']:
             raise ValueError(f'Checksum mismatch: {sid}')
+        if meta(data).get('history_base') and not s.get('segments'):
+            raise ValueError('Linked rollout requires history segments; re-export with chain support')
         if meta(data).get('id') != sid or s['thread'].get('id') != sid or set(s['thread'])-FIELDS:
             raise ValueError(f'Invalid metadata: {sid}')
         if relative(s['cwd'],old) is None:
             raise ValueError(f'Session outside backup project: {sid}')
         for line in data.splitlines(): json.loads(line)
+        mapping = {}
+        for asset in s.get('assets',[]):
+            if asset['status'] != 'bundled': continue
+            source = checked_file(backup,asset)
+            target_asset = home/'attachments'/'restored'/sid/source.name
+            if not target_asset.resolve().is_relative_to(home.resolve()):
+                raise ValueError('Attachment destination escapes Codex home')
+            if target_asset.exists(): raise ValueError(f'Existing attachment conflict: {target_asset}')
+            content = source.read_bytes()
+            if hashlib.sha256(content).hexdigest() != asset['sha256']: raise ValueError('Attachment checksum mismatch')
+            asset_files[target_asset] = content
+            mapping[asset['reference']] = target_asset.as_uri() if asset['reference'].startswith('file:') else str(target_asset)
+        asset_mappings[sid] = mapping
         offsets = None
-        if new: data,offsets = rewrite(data,old,new)
+        if new or mapping: data,offsets = rewrite(data,old,new,mapping)
         # Codex scanning expects the conventional date hierarchy and UUID filename.
         stamp = s['timestamp'] or datetime.fromtimestamp(s['thread']['created_at'],timezone.utc).isoformat()
         dt = datetime.fromisoformat(stamp.replace('Z','+00:00'))
@@ -336,11 +404,18 @@ def restore(home, backup, new_project=None):
                     for entry in entries:
                         entry=dict(entry)
                         if entry.get('thread_id') != sid: raise ValueError('Cross-session row in backup')
+                        if entry.get('item_json') and asset_mappings[sid]:
+                            entry['item_json'] = json.dumps(replace_references(json.loads(entry['item_json']),asset_mappings[sid]))
                         for k,v in list(entry.items()):
                             if offsets is not None and k.endswith('byte_offset') and v is not None:
                                 if v not in offsets: raise ValueError(f'History offset is not a rollout boundary: {sid}')
                                 entry[k]=offsets[v]
                         insert(db,schema,table,entry)
+        for target,content in asset_files.items():
+            target.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+            fd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+            created.append(target)
+            with os.fdopen(fd,'wb') as f: f.write(content); f.flush(); os.fsync(f.fileno())
         for s,data,offsets,target,row in prepared:
             target.parent.mkdir(parents=True,exist_ok=True)
             fd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
@@ -353,7 +428,8 @@ def restore(home, backup, new_project=None):
         raise
     finally:
         db.close()
-    return {'restored':len(prepared),'codex_home':str(home)}
+    return {'restored':len(prepared),'codex_home':str(home),'restored_asset_files':len(asset_files),
+            'unresolved_assets':sum(a['status']=='unresolved' for s in manifest['sessions'] for a in s.get('assets',[]))}
 
 
 def main():
@@ -361,19 +437,26 @@ def main():
     parser.add_argument('--codex-home',type=Path,default=Path(os.environ.get('CODEX_HOME','~/.codex')).expanduser())
     sub=parser.add_subparsers(dest='command',required=True)
     exp=sub.add_parser('export');exp.add_argument('project_path');exp.add_argument('destination',type=Path)
+    exp.add_argument('--include-attachments',action='store_true')
+    check=sub.add_parser('verify',help='Check a backup offline without restoring it');check.add_argument('backup',type=Path)
     bulk=sub.add_parser('export-all', help='Export all sessions grouped into separate project backups')
     bulk.add_argument('destination',type=Path);bulk.add_argument('--dry-run',action='store_true')
+    bulk.add_argument('--include-attachments',action='store_true')
     res=sub.add_parser('restore');res.add_argument('backup',type=Path);res.add_argument('new_project_path',nargs='?')
     args=parser.parse_args()
     try:
         home=args.codex_home.expanduser().resolve()
-        if args.command == 'export-all':
-            result=export_all(home,args.destination.expanduser().resolve(),args.dry_run)
+        if args.command == 'verify':
+            result=verify(args.backup.expanduser().resolve())
+        elif args.command == 'export-all':
+            result=export_all(home,args.destination.expanduser().resolve(),args.dry_run,args.include_attachments)
         elif args.command == 'export':
-            result=export(home,args.project_path,args.destination.expanduser().resolve())
+            result=export(home,args.project_path,args.destination.expanduser().resolve(),include_attachments=args.include_attachments)
         else:
             result=restore(home,args.backup.expanduser().resolve(),args.new_project_path)
         print(dumps(result),end='')
+        if result.get('valid') is False:
+            return 1
         if result.get('complete') is False:
             return 2
     except (ValueError,OSError,sqlite3.Error,KeyError,TypeError) as e:

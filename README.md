@@ -1,66 +1,99 @@
-# Codex project session backups
+# Codex Session Backup
 
-An independent community tool, not affiliated with or endorsed by OpenAI.
+Back up and restore Codex conversations by project. Export one project or all your projects, check your backups offline, and restore them on another machine or at a new project path.
 
-A small Python 3.10+ CLI with no dependencies. Inspected and integration-tested against **codex-cli 0.154.0** and its installed app-server protocol on September 10, 2026.
+An independent community tool, not affiliated with or endorsed by OpenAI. [MIT licensed](LICENSE).
 
-Licensed under the [MIT License](LICENSE).
+## Get started
 
-```bash
-./codex_sessions.py export /path/to/project /path/to/new-backup
-./codex_sessions.py restore /path/to/new-backup /path/to/moved-project
-# Omit the last argument to keep the recorded project paths.
-./codex_sessions.py --codex-home /path/to/.codex restore /path/to/new-backup /new/project
-```
-
-`CODEX_HOME` is honored; the default is `~/.codex`. Export destinations must not exist. Stop sessions being exported; close Codex CLI/Desktop on the restore target. For a fresh installation, launch Codex once and close it to initialize its state and history databases. The utility does not need authentication or network access. Use the same Codex version on both machines for the most predictable result.
-
-Copy the entire backup directory to the other machine, including Windows/WSL. Recorded Windows paths can be mapped to a POSIX destination and vice versa; restore uses the destination Python platform's path conventions. Descendant working directories retain their relative suffix. Project files themselves are not backed up.
-
-## Format and selection
-
-Version 1 is `manifest.json` plus `rollouts/<session-id>.jsonl`. The manifest contains the original project path, export time, source database filenames, session IDs, original working directories and rollout paths, timestamps, titles/names and other selected thread metadata, SHA-256 checksums, and per-session history/tool rows as ordinary JSON. Exported rollout bytes are unchanged.
-
-Selection uses the rollout's recorded `cwd` (falling back to its index for older formats), including the project root and descendants with path-component boundaries. Active and archived directories are scanned, including unindexed legacy rollouts. Ancient records with no attributable cwd are counted as skipped. Unindexed paginated sessions fail explicitly because their completeness cannot be established. The entire selected conversation is included even if individual turns visited another directory; fork/parent identifiers remain intact, but other projects' parent/child sessions are not automatically included.
-
-Only session rollouts and allowlisted session rows are exported. No auth files, tokens from configuration, caches, global history, projects, memories, or whole SQLite databases are copied. **Conversation contents can themselves contain secrets or personal data**, as can titles and tool descriptions; protect the backup like the original conversations. External attachments/images and paths referenced in message text are not bundled.
-
-## Restore behavior and observed indexing
-
-Local inspection found `state_5.sqlite`'s `threads` table and paginated history in `thread_history_1.sqlite`. In an isolated experiment, copying a rollout alone allowed a metadata read by ID, but did not provide normal listing or paginated turns. Restoring the selected `threads`, `thread_dynamic_tools`, `thread_turns`, `thread_items`, `thread_realtime_items`, and `thread_history_projection_state` rows passed normal app-server list/read/turns/resume checks. No `session_index.jsonl` writes were needed; names are retained in the thread metadata. Existing entries in that file still count as conflicts.
-
-The tool discovers databases by table presence and checks inserted columns against the target schema. It does not create/migrate Codex schemas or copy migration records. Multiple candidate databases, incompatible columns, or required target fields without defaults fail explicitly. This is deliberately conservative across future releases.
-
-Restore preserves IDs, sources, archive status, provider/model metadata, and session-specific policies. It does not import global project/sidebar group associations. Archived and noninteractive sessions remain subject to Codex's normal filters (`codex resume --all`, `--include-non-interactive`, and Desktop archive views). Switch Desktop to the restored project and refresh/restart it if needed. Backend compatibility was tested; the Desktop GUI and an interactive TUI picker were not directly exercised.
-
-Moving a project remaps structured `cwd`, workspace roots, and project-local permission paths in session metadata, turn context, world state and applied thread-settings events, plus the indexed cwd/sandbox policy. Literal conversation text and tool arguments are preserved. History byte offsets are recalculated to match rewritten JSONL lengths. References outside the original project remain unchanged.
-
-All backup content is validated before session files are written. Conflicting IDs in rollouts, state/history rows, or the name index cause an error; there is no overwrite/merge option. SQLite inserts use a transaction, files use exclusive creation, and ordinary failures roll back inserted rows and remove newly created files. An abrupt process/machine crash can leave partial files or cross-database state (especially with SQLite WAL); a retry reports conflicts instead of overwriting them. Keep the original backup until you verify restoration.
-
-## Tests
+Requires **Python 3.10 or newer**. No extra Python packages, account login, or network access are needed to run the tool.
 
 ```bash
-python3 -m unittest discover -s tests -v
-# Optional installed-Codex integration test: reads and copies one CLI session,
-# creates disposable databases, then lists/reads/resumes ONLY the copy.
-python3 tests/integration_codex.py ~/.codex
+git clone https://github.com/MisterSheikh/codex-session-backup.git
+cd codex-session-backup
+python3 codex_sessions.py --help
 ```
 
-The integration fixture copies schema/migration definitions to initialize its disposable databases; that is test scaffolding and is not part of export or restore. It does not send a model turn or copy authentication. Unit tests cover project boundaries, moved paths, history offsets, byte-preserving restoration, tampering, path traversal, conflicts, and rollback.
+Keep the repository's Python files together. The default session location is `~/.codex`; `CODEX_HOME` or `--codex-home /another/.codex` can override it.
 
-## Export every project at once
+**Close Codex before making your final export or restoring sessions.** Back up your project files separately. Backup folders must be new; existing sessions are never silently overwritten.
+
+## Back up one project
 
 ```bash
-./codex_sessions.py export-all ~/codex-session-backups --dry-run
-./codex_sessions.py export-all ~/codex-session-backups
-# Restore just one of the resulting projects:
-./codex_sessions.py restore ~/codex-session-backups/widaR ~/widaR
+python3 codex_sessions.py export ~/my-project ~/my-project-backup --include-attachments
 ```
 
-`export-all` scans session rollouts and index entries, assigns each rollout to one group, and writes a separate version-1 backup for each group. Existing selective `export` and `restore` commands still work. The destination must not already exist; use a new dated destination for subsequent snapshots.
+This includes sessions started in the project and its subdirectories, including archived sessions. Omit `--include-attachments` if you only want conversation data; external attachment references will still be reported.
 
-Grouping prefers the most specific registered Codex project root, then the nearest existing Git root (including worktree `.git` files), then the exact recorded cwd. These are path-based heuristics: deleted/moved repositories fall back to recorded cwd, and separate checkouts stay separate. No conversation-text guesses are made. Home-directory sessions do not absorb nested project sessions. The top-level `index.json` records original roots, grouping reasons, session assignments and outcomes. Folder names use project basenames; collisions receive a path-derived suffix.
+## Back up all projects
 
-`--dry-run` prints the assignment plan without writing a backup. A real run attempts every project even if one fails. Unattributable rollouts are preserved as raw JSONL under `_unassigned`, with original paths and checksums in `index.json`; they are **not** normal restorable project backups until their project/metadata can be established. Missing/unreadable files and failed projects are reported explicitly. Exit code 2 means the collection needs attention (unassigned sessions or failed projects); exit code 1 means a top-level error. Successfully exported project directories remain individually restorable.
+Preview how sessions will be grouped:
 
-If multiple rollouts share a session ID, bulk export uses the file referenced by Codex's thread index for the restorable backup and preserves the other versions under `_unassigned`. This keeps the indexed history paired with its rollout without discarding older variants. The report explains these cases; `complete: false` can therefore mean all files were preserved but some require manual classification.
+```bash
+python3 codex_sessions.py export-all ~/codex-session-backups --dry-run
+```
+
+Create the backups:
+
+```bash
+python3 codex_sessions.py export-all ~/codex-session-backups --include-attachments
+```
+
+Each project gets an individually restorable subdirectory. Linked conversation segments are included automatically; keep the entire folder together. `index.json` lists the projects and any problems. Sessions with unclear project ownership, and extra versions of duplicate sessions, are preserved under `_unassigned` for manual review; that folder is not a normal restorable project backup.
+
+For later snapshots, choose a new destination such as `~/codex-session-backups-next`.
+
+## Verify a backup
+
+After copying a backup to another disk or machine:
+
+```bash
+# One project
+python3 codex_sessions.py verify ~/my-project-backup
+
+# An entire collection
+python3 codex_sessions.py verify ~/codex-session-backups
+```
+
+Verification runs offline and does not change your backup or Codex installation. It checks files, checksums, conversation IDs, saved metadata, history offsets, and bundled attachments.
+
+Read the JSON result:
+
+- **`valid: true`**: the implemented integrity checks passed.
+- **`complete: false`**: read `warnings` and `errors`. Files may be unresolved, some sessions may need manual attention, or an older backup may lack attachment information.
+- **`resume_tested: false`**: verification does not launch Codex. It cannot promise that a particular Codex version will resume the conversations.
+
+Exit codes: **0** = checks passed without warnings; **1** = error or invalid backup; **2** = attention needed, such as unresolved attachments. An export returning 2 may still have created usable project backups—read its report.
+
+## Restore one project
+
+On the destination machine, install and launch Codex once, then close it. Copy the **entire project backup folder**, including any `assets` directory, and run:
+
+```bash
+python3 codex_sessions.py restore ~/my-project-backup ~/projects/my-project
+```
+
+The final argument is the new project location. Omit it to keep the original paths. To restore one project from a bulk collection, point at that project's subdirectory:
+
+```bash
+python3 codex_sessions.py restore ~/codex-session-backups/my-project ~/projects/my-project
+cd ~/projects/my-project
+codex resume
+```
+
+Archived and noninteractive sessions retain their normal Codex visibility rules. Refresh or restart Desktop if its list is stale. Keep your original environment or a private fallback until you have inspected restored conversations on the destination.
+
+## What about images and attachments?
+
+Images embedded directly in conversations are already backed up. With `--include-attachments`, the tool also bundles recognizable referenced files inside Codex's managed upload and generated-image directories. Their references are updated during restore.
+
+It does **not** download remote URLs, copy arbitrary files from your project or elsewhere, or copy the global attachment registry. Missing files and recognized references that cannot be bundled are reported. Detection is conservative: a clean report is not proof that every possible external artifact was found. See the [attachment investigation](docs/attachments.md) for coverage and limitations.
+
+## Compatibility and privacy
+
+Tested with **Codex CLI 0.154.0**. Codex's internal storage can change; prefer matching versions for migration. Backups from the original version-1 format remain supported, but verification reports their unknown attachment completeness. New exports use format version 3, which also preserves linked history segments. Ordinary version-1 and version-2 backups remain supported; older backups missing linked segments must be re-exported from the original installation.
+
+Credentials, global configuration, and caches are excluded. **Conversations and attachments can themselves contain secrets or personal information. Keep your backups private.** Checksums detect corruption; they do not establish who created or modified a backup.
+
+For storage details, failure behavior, and testing instructions, see [implementation notes](docs/implementation.md).
